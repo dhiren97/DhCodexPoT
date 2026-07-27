@@ -1,0 +1,183 @@
+name: Secure Gujarati transcription v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - secure/START_V2
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish one-time worker public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out /tmp/worker_private.pem
+          openssl pkey -in /tmp/worker_private.pem -pubout -out /tmp/worker_public.pem
+          mkdir -p secure/v2
+          cp /tmp/worker_public.pem secure/v2/worker_public.pem
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add secure/v2/worker_public.pem
+          git commit -m "Publish v2 one-time transcription key"
+          git push origin HEAD:main
+
+      - name: Wait for encrypted payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for attempt in $(seq 1 1440); do
+            git fetch origin main --quiet
+            if git cat-file -e origin/main:secure/v2/READY 2>/dev/null; then
+              git reset --hard origin/main
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Encrypted payload did not arrive within four hours." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg xz-utils
+          python -m pip install --upgrade pip
+          python -m pip install faster-whisper
+
+      - name: Decrypt and decode audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat secure/v2/payload.b64.part* | tr -d '\n\r' | base64 --decode > /tmp/audio_payload.enc
+          tr -d '\n\r' < secure/v2/audio_key.b64 | base64 --decode > /tmp/audio_key.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/worker_private.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/audio_key.enc \
+            -out /tmp/audio_key.bin
+          openssl enc -d -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -pass file:/tmp/audio_key.bin \
+            -in /tmp/audio_payload.enc \
+            -out /tmp/audio.c2.xz
+          xz -dc /tmp/audio.c2.xz > /tmp/audio.c2
+          ffmpeg -hide_banner -loglevel error -f codec2 -i /tmp/audio.c2 \
+            -ac 1 -ar 16000 -c:a pcm_s16le /tmp/audio.wav
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 /tmp/audio.wav
+
+      - name: Transcribe Gujarati discourse
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/transcribe.py <<'PY'
+          import json
+          import os
+          from faster_whisper import WhisperModel
+
+          prompt = (
+              "આ ગુજરાતી જૈન ધાર્મિક પ્રવચન છે. વિષય અગુરુ લઘુગુણ, દ્રવ્યની સ્વતંત્રતા, "
+              "સ્વચતુષ્ટય, પરચતુષ્ટય, ગુણ, પર્યાય, નવ પ્રકારનું અપરિણમન, જીવપ્રદેશ, પુદગલ, "
+              "ધર્માસ્તિકાય, અધર્માસ્તિકાય, આકાશ, કાળ, જ્ઞાન, દર્શન, વીર્ય, આત્મદૃષ્ટિ, "
+              "ઉપાદાન, નિમિત્ત, વ્યવહારનય અને નિશ્ચયનય છે. જૈન તત્ત્વજ્ઞાનના શબ્દોની ગુજરાતી જોડણી જાળવો."
+          )
+
+          model = WhisperModel(
+              "large-v3-turbo",
+              device="cpu",
+              compute_type="int8",
+              cpu_threads=max(2, os.cpu_count() or 4),
+              num_workers=1,
+          )
+          segments, info = model.transcribe(
+              "/tmp/audio.wav",
+              language="gu",
+              task="transcribe",
+              beam_size=5,
+              best_of=5,
+              temperature=0.0,
+              vad_filter=True,
+              vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 250},
+              condition_on_previous_text=True,
+              initial_prompt=prompt,
+              word_timestamps=False,
+              no_speech_threshold=0.6,
+              compression_ratio_threshold=2.4,
+              log_prob_threshold=-1.0,
+          )
+
+          rows = []
+          text_lines = []
+          plain_lines = []
+          for seg in segments:
+              text = seg.text.strip()
+              if not text:
+                  continue
+              rows.append({
+                  "start": round(float(seg.start), 3),
+                  "end": round(float(seg.end), 3),
+                  "text": text,
+                  "avg_logprob": round(float(seg.avg_logprob), 5),
+                  "no_speech_prob": round(float(seg.no_speech_prob), 5),
+              })
+              text_lines.append(f"[{seg.start:09.3f} --> {seg.end:09.3f}] {text}")
+              plain_lines.append(text)
+
+          payload = {
+              "language": info.language,
+              "language_probability": float(info.language_probability),
+              "duration": float(info.duration),
+              "duration_after_vad": float(getattr(info, "duration_after_vad", info.duration)),
+              "segments": rows,
+          }
+          with open("/tmp/transcript.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, ensure_ascii=False, indent=2)
+          with open("/tmp/transcript_timestamped.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(text_lines) + "\n")
+          with open("/tmp/transcript_plain.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(plain_lines) + "\n")
+          print(f"Transcription completed: {len(rows)} segments; language={info.language}")
+          PY
+          python /tmp/transcribe.py
+
+      - name: Encrypt transcript for return
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C /tmp -czf /tmp/transcript_bundle.tar.gz transcript_plain.txt transcript_timestamped.txt transcript.json
+          openssl rand 32 > /tmp/result_key.bin
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -pass file:/tmp/result_key.bin \
+            -in /tmp/transcript_bundle.tar.gz \
+            -out /tmp/transcript_bundle.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey secure/client_public.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/result_key.bin \
+            -out /tmp/result_key.enc
+          mkdir -p secure/v2/result
+          base64 -w 0 /tmp/transcript_bundle.enc | split -b 16000 -d -a 3 - secure/v2/result/bundle.b64.part
+          base64 -w 0 /tmp/result_key.enc > secure/v2/result/key.b64
+          printf 'done\n' > secure/v2/DONE
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add secure/v2/result secure/v2/DONE
+          git commit -m "Publish encrypted Gujarati transcription result"
+          git push origin HEAD:main
